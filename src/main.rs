@@ -1,3 +1,4 @@
+use clap::Parser;
 use log::{error, info, LevelFilter};
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::server::{Auth, Msg, Server as _, Session};
@@ -8,6 +9,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Configurazione da linea di comando
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Indirizzo IP su cui ascoltare
+    #[arg(short, long, default_value = "0.0.0.0")]
+    host: String,
+
+    /// Porta su cui ascoltare
+    #[arg(short, long, default_value = "22")]
+    port: u16,
+}
 
 #[derive(Clone)]
 struct Server;
@@ -174,6 +188,9 @@ async fn main() {
         .filter_level(LevelFilter::Debug)
         .init();
 
+    // Parsing degli argomenti da linea di comando
+    let args = Args::parse();
+
     let config = russh::server::Config {
         auth_rejection_time: Duration::from_secs(3),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
@@ -189,11 +206,8 @@ async fn main() {
         .run_on_address(
             Arc::new(config),
             (
-                "0.0.0.0",
-                std::env::var("PORT")
-                    .unwrap_or("22".to_string())
-                    .parse()
-                    .unwrap(),
+                args.host.as_str(),
+                args.port,
             ),
         )
         .await

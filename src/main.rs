@@ -21,6 +21,14 @@ struct Args {
     /// Porta su cui ascoltare
     #[arg(short, long, default_value = "22")]
     port: u16,
+
+    /// Username per autenticazione password
+    #[arg(long, default_value = "admin")]
+    username: String,
+
+    /// Password per autenticazione password
+    #[arg(long, default_value = "password")]
+    password: String,
 }
 
 #[derive(Clone)]
@@ -58,7 +66,12 @@ impl russh::server::Handler for SshSession {
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         info!("credentials: {}, {}", user, password);
-        Ok(Auth::Accept)
+        let args = Args::parse();
+        if user == args.username && password == args.password {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+        }
     }
 
     async fn auth_publickey(

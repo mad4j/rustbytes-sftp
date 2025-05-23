@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Configurazione da linea di comando
 #[derive(Parser, Debug)]
@@ -36,6 +36,10 @@ struct Args {
     /// Directory radice per le operazioni SFTP
     #[arg(long, default_value = ".")]
     root_dir: PathBuf,
+
+    /// Dimensione massima del buffer per il download (in bytes)
+    #[arg(long, default_value = "32768")]
+    max_read_size: u32,
 }
 
 #[derive(Clone)]
@@ -48,6 +52,7 @@ struct ServerConfig {
     username: String,
     password: String,
     root_dir: PathBuf,
+    max_read_size: u32,
 }
 
 impl russh::server::Server for Server {
@@ -140,12 +145,78 @@ impl russh::server::Handler for SshSession {
     }
 }
 
+#[derive(Debug)]
+struct OpenFile {
+    file: tokio::fs::File,
+    path: PathBuf,
+    is_binary: bool,
+}
+
+impl OpenFile {
+    async fn new(path: PathBuf) -> Result<Self, std::io::Error> {
+        let file = fs::File::open(&path).await?;
+        let is_binary = Self::detect_binary_file(&path).await;
+        
+        info!("Opened file: {:?}, binary: {}", path, is_binary);
+        
+        Ok(Self {
+            file,
+            path,
+            is_binary,
+        })
+    }
+
+    async fn detect_binary_file(path: &Path) -> bool {
+        // Controllo basato sull'estensione del file
+        if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+            let binary_extensions = [
+                "exe", "dll", "so", "dylib", "bin", "dat", "db", "sqlite", "sqlite3",
+                "jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp", "ico",
+                "mp3", "wav", "ogg", "flac", "aac", "m4a",
+                "mp4", "avi", "mkv", "mov", "wmv", "flv", "webm",
+                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+                "zip", "rar", "7z", "tar", "gz", "bz2", "xz",
+                "obj", "lib", "a", "deb", "rpm", "dmg", "iso"
+            ];
+            
+            if binary_extensions.contains(&extension.to_lowercase().as_str()) {
+                return true;
+            }
+        }
+
+        // Controllo del contenuto del file (primi 512 bytes)
+        if let Ok(mut file) = fs::File::open(path).await {
+            let mut buffer = [0u8; 512];
+            if let Ok(bytes_read) = file.read(&mut buffer).await {
+                let sample = &buffer[..bytes_read];
+                
+                // Se contiene byte nulli, probabilmente è binario
+                if sample.contains(&0) {
+                    return true;
+                }
+                
+                // Controlla la percentuale di caratteri non-ASCII
+                let non_ascii_count = sample.iter().filter(|&&b| b > 127).count();
+                let non_ascii_percentage = (non_ascii_count as f32 / bytes_read as f32) * 100.0;
+                
+                // Se più del 30% dei caratteri sono non-ASCII, probabilmente è binario
+                if non_ascii_percentage > 30.0 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
 struct SftpSession {
     version: Option<u32>,
     root_dir: PathBuf,
-    open_files: HashMap<String, tokio::fs::File>,
+    open_files: HashMap<String, OpenFile>,
     open_dirs: HashMap<String, tokio::fs::ReadDir>,
     handle_counter: u32,
+    max_read_size: u32,
 }
 
 impl SftpSession {
@@ -156,6 +227,7 @@ impl SftpSession {
             open_files: HashMap::new(),
             open_dirs: HashMap::new(),
             handle_counter: 0,
+            max_read_size: config.max_read_size,
         }
     }
 
@@ -258,8 +330,9 @@ impl russh_sftp::server::Handler for SftpSession {
         info!("close handle: {}", handle);
         
         // Rimuovi il file o directory dal tracking
-        if self.open_files.remove(&handle).is_some() {
-            info!("Closed file handle: {}", handle);
+        if let Some(open_file) = self.open_files.remove(&handle) {
+            info!("Closed file handle: {} (path: {:?}, binary: {})", 
+                  handle, open_file.path, open_file.is_binary);
         } else if self.open_dirs.remove(&handle).is_some() {
             info!("Closed directory handle: {}", handle);
         }
@@ -358,19 +431,33 @@ impl russh_sftp::server::Handler for SftpSession {
         }
     }
 
-    async fn open(&mut self, id: u32, path: String, _pflags: OpenFlags, _attrs: FileAttributes) -> Result<Handle, Self::Error> {
-        info!("open file: {}", path);
+    async fn open(&mut self, id: u32, path: String, pflags: OpenFlags, _attrs: FileAttributes) -> Result<Handle, Self::Error> {
+        info!("open file: {} with flags: {:?}", path, pflags);
         
         let resolved_path = self.resolve_path(&path)?;
         
-        match fs::File::open(&resolved_path).await {
-            Ok(file) => {
+        // Controlla se il file esiste
+        if !resolved_path.exists() {
+            warn!("File does not exist: {:?}", resolved_path);
+            return Err(StatusCode::NoSuchFile);
+        }
+
+        // Controlla se è un file regolare
+        if !resolved_path.is_file() {
+            warn!("Path is not a regular file: {:?}", resolved_path);
+            return Err(StatusCode::Failure);
+        }
+
+        match OpenFile::new(resolved_path).await {
+            Ok(open_file) => {
                 let handle = self.next_handle();
-                self.open_files.insert(handle.clone(), file);
+                info!("Successfully opened file with handle: {} (binary: {})", 
+                      handle, open_file.is_binary);
+                self.open_files.insert(handle.clone(), open_file);
                 Ok(Handle { id, handle })
             }
             Err(e) => {
-                warn!("Failed to open file {:?}: {}", resolved_path, e);
+                warn!("Failed to open file: {}", e);
                 match e.kind() {
                     std::io::ErrorKind::NotFound => Err(StatusCode::NoSuchFile),
                     std::io::ErrorKind::PermissionDenied => Err(StatusCode::PermissionDenied),
@@ -380,30 +467,54 @@ impl russh_sftp::server::Handler for SftpSession {
         }
     }
 
+    /// Implementazione migliorata del comando READ per supportare download di file di testo e binari
     async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<russh_sftp::protocol::Data, Self::Error> {
-        info!("read handle: {}, offset: {}, len: {}", handle, offset, len);
+        info!("read handle: {}, offset: {}, requested len: {}", handle, offset, len);
         
-        if let Some(file) = self.open_files.get_mut(&handle) {
-            use tokio::io::AsyncSeekExt;
+        if let Some(open_file) = self.open_files.get_mut(&handle) {
+            // Limita la dimensione della lettura al massimo configurato
+            let actual_len = std::cmp::min(len, self.max_read_size);
             
-            match file.seek(std::io::SeekFrom::Start(offset)).await {
-                Ok(_) => {
-                    let mut buffer = vec![0u8; len as usize];
-                    match file.read(&mut buffer).await {
+            match open_file.file.seek(std::io::SeekFrom::Start(offset)).await {
+                Ok(actual_offset) => {
+                    if actual_offset != offset {
+                        warn!("Seek to {} resulted in position {}", offset, actual_offset);
+                    }
+                    
+                    let mut buffer = vec![0u8; actual_len as usize];
+                    match open_file.file.read(&mut buffer).await {
                         Ok(bytes_read) => {
-                            buffer.truncate(bytes_read);
                             if bytes_read == 0 {
+                                info!("End of file reached for handle: {}", handle);
                                 Err(StatusCode::Eof)
                             } else {
+                                buffer.truncate(bytes_read);
+                                
+                                info!("Successfully read {} bytes from handle: {} (binary: {}, offset: {})", 
+                                      bytes_read, handle, open_file.is_binary, offset);
+                                
+                                // Log aggiuntivo per file di testo (primi 100 caratteri se non binario)
+                                if !open_file.is_binary && bytes_read > 0 {
+                                    let preview = String::from_utf8_lossy(&buffer[..std::cmp::min(100, bytes_read)]);
+                                    info!("Text file preview: {}", preview.chars().take(50).collect::<String>());
+                                }
+                                
                                 Ok(russh_sftp::protocol::Data { id, data: buffer })
                             }
                         }
-                        Err(_) => Err(StatusCode::Failure),
+                        Err(e) => {
+                            error!("Failed to read from file handle {}: {}", handle, e);
+                            Err(StatusCode::Failure)
+                        }
                     }
                 }
-                Err(_) => Err(StatusCode::Failure),
+                Err(e) => {
+                    error!("Failed to seek in file handle {}: {}", handle, e);
+                    Err(StatusCode::Failure)
+                }
             }
         } else {
+            warn!("Invalid file handle: {}", handle);
             Err(StatusCode::BadMessage)
         }
     }
@@ -416,6 +527,8 @@ impl russh_sftp::server::Handler for SftpSession {
         match fs::metadata(&resolved_path).await {
             Ok(metadata) => {
                 let attrs = Self::metadata_to_file_attributes(&metadata).await;
+                info!("stat result for {:?}: size={:?}, is_file={}", 
+                      resolved_path, attrs.size, metadata.is_file());
                 Ok(russh_sftp::protocol::Attrs { id, attrs })
             }
             Err(e) => {
@@ -453,15 +566,19 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn fstat(&mut self, id: u32, handle: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
         info!("fstat handle: {}", handle);
         
-        if let Some(file) = self.open_files.get(&handle) {
-            match file.metadata().await {
+        if let Some(open_file) = self.open_files.get(&handle) {
+            match open_file.file.metadata().await {
                 Ok(metadata) => {
                     let attrs = Self::metadata_to_file_attributes(&metadata).await;
                     Ok(russh_sftp::protocol::Attrs { id, attrs })
                 }
-                Err(_) => Err(StatusCode::Failure),
+                Err(e) => {
+                    error!("Failed to get metadata for handle {}: {}", handle, e);
+                    Err(StatusCode::Failure)
+                }
             }
         } else {
+            warn!("Invalid file handle for fstat: {}", handle);
             Err(StatusCode::BadMessage)
         }
     }
@@ -497,11 +614,13 @@ async fn main() {
     };
 
     info!("SFTP root directory: {:?}", root_dir);
+    info!("Max read buffer size: {} bytes", args.max_read_size);
 
     let server_config = Arc::new(ServerConfig {
         username: args.username,
         password: args.password,
         root_dir,
+        max_read_size: args.max_read_size,
     });
 
     let config = russh::server::Config {
@@ -518,6 +637,7 @@ async fn main() {
     };
 
     info!("Starting SFTP server on {}:{}", args.host, args.port);
+    info!("Use credentials: username='{}', password='***'", server.config.username);
 
     server
         .run_on_address(

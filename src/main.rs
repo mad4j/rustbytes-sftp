@@ -1,3 +1,4 @@
+use args::Args;
 use clap::Parser;
 use log::{error, info, warn, LevelFilter};
 use russh::keys::ssh_key::rand_core::OsRng;
@@ -13,36 +14,9 @@ use tokio::sync::Mutex;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+mod args;
 mod server;
 
-/// Configurazione da linea di comando
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Indirizzo IP su cui ascoltare
-    #[arg(short, long, default_value = "0.0.0.0")]
-    host: String,
-
-    /// Porta su cui ascoltare
-    #[arg(short, long, default_value = "22")]
-    port: u16,
-
-    /// Username per autenticazione password
-    #[arg(long, default_value = "admin")]
-    username: String,
-
-    /// Password per autenticazione password
-    #[arg(long, default_value = "password")]
-    password: String,
-
-    /// Directory radice per le operazioni SFTP
-    #[arg(long, default_value = ".")]
-    root_dir: PathBuf,
-
-    /// Dimensione massima del buffer per il download (in bytes)
-    #[arg(long, default_value = "32768")]
-    max_read_size: u32,
-}
 
 pub struct SshSession {
     clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,

@@ -4,14 +4,16 @@ use russh::keys::ssh_key::rand_core::OsRng;
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version};
+use server::{Server, ServerConfig};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+mod server;
 
 /// Configurazione da linea di comando
 #[derive(Parser, Debug)]
@@ -42,28 +44,7 @@ struct Args {
     max_read_size: u32,
 }
 
-#[derive(Clone)]
-struct Server {
-    config: Arc<ServerConfig>,
-}
-
-#[derive(Debug)]
-struct ServerConfig {
-    username: String,
-    password: String,
-    root_dir: PathBuf,
-    max_read_size: u32,
-}
-
-impl russh::server::Server for Server {
-    type Handler = SshSession;
-
-    fn new_client(&mut self, _: Option<SocketAddr>) -> Self::Handler {
-        SshSession::new(self.config.clone())
-    }
-}
-
-struct SshSession {
+pub struct SshSession {
     clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
     config: Arc<ServerConfig>,
 }

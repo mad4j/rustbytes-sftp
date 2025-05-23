@@ -285,7 +285,32 @@ impl SftpSession {
             use std::os::unix::fs::MetadataExt;
             attrs.uid = Some(metadata.uid());
             attrs.gid = Some(metadata.gid());
-            attrs.permissions = Some(metadata.mode());
+            
+            // Imposta correttamente i permessi e il tipo di file
+            let mut mode = metadata.mode();
+            
+            // Assicurati che i bit del tipo di file siano impostati correttamente
+            if metadata.is_file() {
+                mode |= 0o100000; // S_IFREG - file regolare
+            } else if metadata.is_dir() {
+                mode |= 0o040000; // S_IFDIR - directory
+            } else if metadata.file_type().is_symlink() {
+                mode |= 0o120000; // S_IFLNK - link simbolico
+            }
+            
+            attrs.permissions = Some(mode);
+        }
+        
+        #[cfg(windows)]
+        {
+            // Su Windows, imposta permessi di base
+            let mut mode = 0o644; // rw-r--r-- per file
+            if metadata.is_dir() {
+                mode = 0o755 | 0o040000; // rwxr-xr-x + directory flag
+            } else if metadata.is_file() {
+                mode = 0o644 | 0o100000; // rw-r--r-- + regular file flag
+            }
+            attrs.permissions = Some(mode);
         }
         
         if let Ok(modified) = metadata.modified() {
@@ -299,8 +324,66 @@ impl SftpSession {
                 attrs.atime = Some(duration.as_secs() as u32);
             }
         }
-        
+
         attrs
+    }
+
+    async fn format_longname(filename: &str, metadata: &std::fs::Metadata) -> String {
+        let _file_type = if metadata.is_dir() {
+            'd'
+        } else if metadata.file_type().is_symlink() {
+            'l'
+        } else {
+            '-'
+        };
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = metadata.mode();
+            let permissions = format!(
+                "{}{}{}{}{}{}{}{}{}",
+                file_type,
+                if mode & 0o400 != 0 { 'r' } else { '-' },
+                if mode & 0o200 != 0 { 'w' } else { '-' },
+                if mode & 0o100 != 0 { 'x' } else { '-' },
+                if mode & 0o040 != 0 { 'r' } else { '-' },
+                if mode & 0o020 != 0 { 'w' } else { '-' },
+                if mode & 0o010 != 0 { 'x' } else { '-' },
+                if mode & 0o004 != 0 { 'r' } else { '-' },
+                if mode & 0o002 != 0 { 'w' } else { '-' },
+                if mode & 0o001 != 0 { 'x' } else { '-' },
+            );
+            
+            let nlink = metadata.nlink();
+            let uid = metadata.uid();
+            let gid = metadata.gid();
+            let size = metadata.len();
+            
+            // Formato data semplificato
+            let mtime = if let Ok(modified) = metadata.modified() {
+                let datetime = chrono::DateTime::<chrono::Utc>::from(modified);
+                datetime.format("%b %d %H:%M").to_string()
+            } else {
+                "Jan  1 00:00".to_string()
+            };
+            
+            format!("{} {:3} {:5} {:5} {:8} {} {}", 
+                    permissions, nlink, uid, gid, size, mtime, filename)
+        }
+        
+        #[cfg(windows)]
+        {
+            let permissions = if metadata.is_dir() {
+                "drwxr-xr-x"
+            } else {
+                "-rw-r--r--"
+            };
+            
+            let size = metadata.len();
+            format!("{} 1 root root {:8} Jan  1 00:00 {}", 
+                    permissions, size, filename)
+        }
     }
 }
 
@@ -381,10 +464,23 @@ impl russh_sftp::server::Handler for SftpSession {
                         match entry.metadata().await {
                             Ok(metadata) => {
                                 let attrs = Self::metadata_to_file_attributes(&metadata).await;
-                                files.push(File::new(file_name, attrs));
+                                let longname = Self::format_longname(&file_name, &metadata).await;
+                                files.push(File {
+                                    filename: file_name,
+                                    longname,
+                                    attrs,
+                                });
                             }
-                            Err(_) => {
-                                files.push(File::new(file_name, FileAttributes::default()));
+                            Err(e) => {
+                                warn!("Failed to get metadata for {}: {}", file_name, e);
+                                // Crea attributi di default per file regolare
+                                let mut attrs = FileAttributes::default();
+                                attrs.permissions = Some(0o100644); // File regolare con permessi rw-r--r--
+                                files.push(File {
+                                    filename: file_name.clone(),
+                                    longname: format!("-rw-r--r-- 1 root root 0 Jan  1 00:00 {}", file_name),
+                                    attrs,
+                                });
                             }
                         }
                     }

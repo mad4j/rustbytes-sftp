@@ -1,7 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use crate::SshSession;
-
+use crate::ssh_session::SshSession;
 
 #[derive(Clone)]
 pub struct Server {

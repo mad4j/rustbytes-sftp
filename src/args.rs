@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-
 /// Configurazione da linea di comando
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

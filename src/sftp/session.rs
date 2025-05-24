@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -13,193 +12,43 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 
-use crate::{file_info::FileInfo, server::ServerConfig};
+use crate::{file_info::FileInfo, server::ServerConfig, sftp::utils::metadata::MetadataConverter};
+
+use super::{utils::path_resolver::PathResolver, SessionState};
 
 pub struct SftpSession {
+    /*
     version: Option<u32>,
     root_dir: PathBuf,
     open_files: HashMap<String, FileInfo>,
     open_dirs: HashMap<String, tokio::fs::ReadDir>,
     handle_counter: u32,
     max_read_size: u32,
+    */
+    pub(crate) state: SessionState,
+    pub(crate) path_resolver: PathResolver,
 }
 
 impl SftpSession {
     pub fn new(config: Arc<ServerConfig>) -> Self {
         Self {
-            version: None,
-            root_dir: config.root_dir.clone(),
-            open_files: HashMap::new(),
-            open_dirs: HashMap::new(),
-            handle_counter: 0,
-            max_read_size: config.max_read_size,
-        }
-    }
-
-    fn resolve_path(&self, path: &str) -> Result<PathBuf, StatusCode> {
-        let path = if path.starts_with('/') {
-            Path::new(path).strip_prefix("/").unwrap_or(Path::new(path))
-        } else {
-            Path::new(path)
-        };
-
-        let resolved = self.root_dir.join(path);
-
-        // Controllo di sicurezza: il percorso deve rimanere dentro root_dir
-        match resolved.canonicalize() {
-            Ok(canonical) => {
-                if canonical.starts_with(&self.root_dir) {
-                    Ok(canonical)
-                } else {
-                    warn!(
-                        "Tentativo di accesso fuori dalla root directory: {:?}",
-                        canonical
-                    );
-                    Err(StatusCode::PermissionDenied)
-                }
-            }
-            Err(_) => {
-                // Se il path non esiste ancora, controlliamo il parent
-                if let Some(parent) = resolved.parent() {
-                    match parent.canonicalize() {
-                        Ok(canonical_parent) => {
-                            if canonical_parent.starts_with(&self.root_dir) {
-                                Ok(resolved)
-                            } else {
-                                warn!(
-                                    "Tentativo di accesso fuori dalla root directory: {:?}",
-                                    resolved
-                                );
-                                Err(StatusCode::PermissionDenied)
-                            }
-                        }
-                        Err(_) => Err(StatusCode::NoSuchFile),
-                    }
-                } else {
-                    Err(StatusCode::NoSuchFile)
-                }
-            }
+            state: SessionState {
+                version: None,
+                _root_dir: config.root_dir.clone(),
+                open_files: HashMap::new(),
+                open_dirs: HashMap::new(),
+                handle_counter: 0,
+                max_read_size: config.max_read_size,
+            },
+            path_resolver: PathResolver::new(config.root_dir.clone()),
         }
     }
 
     fn next_handle(&mut self) -> String {
-        self.handle_counter += 1;
-        format!("handle_{}", self.handle_counter)
+        self.state.handle_counter += 1;
+        format!("handle_{}", self.state.handle_counter)
     }
 
-    async fn metadata_to_file_attributes(metadata: &std::fs::Metadata) -> FileAttributes {
-        let mut attrs = FileAttributes::default();
-        attrs.size = Some(metadata.len());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            attrs.uid = Some(metadata.uid());
-            attrs.gid = Some(metadata.gid());
-
-            // Imposta correttamente i permessi e il tipo di file
-            let mut mode = metadata.mode();
-
-            // Assicurati che i bit del tipo di file siano impostati correttamente
-            if metadata.is_file() {
-                mode |= 0o100000; // S_IFREG - file regolare
-            } else if metadata.is_dir() {
-                mode |= 0o040000; // S_IFDIR - directory
-            } else if metadata.file_type().is_symlink() {
-                mode |= 0o120000; // S_IFLNK - link simbolico
-            }
-
-            attrs.permissions = Some(mode);
-        }
-
-        #[cfg(windows)]
-        {
-            // Su Windows, imposta permessi di base
-            let mut mode = 0o644; // rw-r--r-- per file
-            if metadata.is_dir() {
-                mode = 0o755 | 0o040000; // rwxr-xr-x + directory flag
-            } else if metadata.is_file() {
-                mode = 0o644 | 0o100000; // rw-r--r-- + regular file flag
-            }
-            attrs.permissions = Some(mode);
-        }
-
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                attrs.mtime = Some(duration.as_secs() as u32);
-            }
-        }
-
-        if let Ok(accessed) = metadata.accessed() {
-            if let Ok(duration) = accessed.duration_since(std::time::UNIX_EPOCH) {
-                attrs.atime = Some(duration.as_secs() as u32);
-            }
-        }
-
-        attrs
-    }
-
-    async fn format_longname(filename: &str, metadata: &std::fs::Metadata) -> String {
-        let _file_type = if metadata.is_dir() {
-            'd'
-        } else if metadata.file_type().is_symlink() {
-            'l'
-        } else {
-            '-'
-        };
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let mode = metadata.mode();
-            let permissions = format!(
-                "{}{}{}{}{}{}{}{}{}",
-                file_type,
-                if mode & 0o400 != 0 { 'r' } else { '-' },
-                if mode & 0o200 != 0 { 'w' } else { '-' },
-                if mode & 0o100 != 0 { 'x' } else { '-' },
-                if mode & 0o040 != 0 { 'r' } else { '-' },
-                if mode & 0o020 != 0 { 'w' } else { '-' },
-                if mode & 0o010 != 0 { 'x' } else { '-' },
-                if mode & 0o004 != 0 { 'r' } else { '-' },
-                if mode & 0o002 != 0 { 'w' } else { '-' },
-                if mode & 0o001 != 0 { 'x' } else { '-' },
-            );
-
-            let nlink = metadata.nlink();
-            let uid = metadata.uid();
-            let gid = metadata.gid();
-            let size = metadata.len();
-
-            // Formato data semplificato
-            let mtime = if let Ok(modified) = metadata.modified() {
-                let datetime = chrono::DateTime::<chrono::Utc>::from(modified);
-                datetime.format("%b %d %H:%M").to_string()
-            } else {
-                "Jan  1 00:00".to_string()
-            };
-
-            format!(
-                "{} {:3} {:5} {:5} {:8} {} {}",
-                permissions, nlink, uid, gid, size, mtime, filename
-            )
-        }
-
-        #[cfg(windows)]
-        {
-            let permissions = if metadata.is_dir() {
-                "drwxr-xr-x"
-            } else {
-                "-rw-r--r--"
-            };
-
-            let size = metadata.len();
-            format!(
-                "{} 1 root root {:8} Jan  1 00:00 {}",
-                permissions, size, filename
-            )
-        }
-    }
 }
 
 impl russh_sftp::server::Handler for SftpSession {
@@ -214,13 +63,13 @@ impl russh_sftp::server::Handler for SftpSession {
         version: u32,
         extensions: HashMap<String, String>,
     ) -> Result<Version, Self::Error> {
-        if self.version.is_some() {
+        if self.state.version.is_some() {
             error!("duplicate SSH_FXP_VERSION packet");
             return Err(StatusCode::ConnectionLost);
         }
 
-        self.version = Some(version);
-        info!("version: {:?}, extensions: {:?}", self.version, extensions);
+        self.state.version = Some(version);
+        info!("version: {:?}, extensions: {:?}", self.state.version, extensions);
         Ok(Version::new())
     }
 
@@ -228,12 +77,12 @@ impl russh_sftp::server::Handler for SftpSession {
         info!("close handle: {}", handle);
 
         // Rimuovi il file o directory dal tracking
-        if let Some(open_file) = self.open_files.remove(&handle) {
+        if let Some(open_file) = self.state.open_files.remove(&handle) {
             info!(
                 "Closed file handle: {} (path: {:?}, binary: {})",
                 handle, open_file.path, open_file.is_binary
             );
-        } else if self.open_dirs.remove(&handle).is_some() {
+        } else if self.state.open_dirs.remove(&handle).is_some() {
             info!("Closed directory handle: {}", handle);
         }
 
@@ -248,12 +97,12 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         info!("opendir: {}", path);
 
-        let resolved_path = self.resolve_path(&path)?;
+        let resolved_path = self.path_resolver.resolve_path(&path)?;
 
         match fs::read_dir(&resolved_path).await {
             Ok(read_dir) => {
                 let handle = self.next_handle();
-                self.open_dirs.insert(handle.clone(), read_dir);
+                self.state.open_dirs.insert(handle.clone(), read_dir);
                 Ok(Handle { id, handle })
             }
             Err(e) => {
@@ -270,7 +119,7 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
         info!("readdir handle: {}", handle);
 
-        if let Some(read_dir) = self.open_dirs.get_mut(&handle) {
+        if let Some(read_dir) = self.state.open_dirs.get_mut(&handle) {
             let mut files = Vec::new();
 
             // Leggi alcuni file dalla directory
@@ -281,8 +130,9 @@ impl russh_sftp::server::Handler for SftpSession {
                         let file_name = entry.file_name().to_string_lossy().to_string();
                         match entry.metadata().await {
                             Ok(metadata) => {
-                                let attrs = Self::metadata_to_file_attributes(&metadata).await;
-                                let longname = Self::format_longname(&file_name, &metadata).await;
+                                //let attrs = Self::metadata_to_file_attributes(&metadata).await;
+                                let attrs = MetadataConverter::to_file_attributes(&metadata).await;
+                                let longname = MetadataConverter::format_longname(&file_name, &metadata).await;
                                 files.push(File {
                                     filename: file_name,
                                     longname,
@@ -323,12 +173,12 @@ impl russh_sftp::server::Handler for SftpSession {
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         info!("realpath: {}", path);
 
-        let resolved_path = self.resolve_path(&path)?;
+        let resolved_path = self.path_resolver.resolve_path(&path)?;
 
         match resolved_path.canonicalize() {
             Ok(canonical) => {
                 // Converti il path canonico in un path relativo alla root
-                let relative_path = if let Ok(rel) = canonical.strip_prefix(&self.root_dir) {
+                let relative_path = if let Ok(rel) = canonical.strip_prefix(&self.path_resolver.get_root_dir()) {
                     format!("/{}", rel.to_string_lossy())
                 } else {
                     "/".to_string()
@@ -355,7 +205,7 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<Handle, Self::Error> {
         info!("open file: {} with flags: {:?}", path, pflags);
 
-        let resolved_path = self.resolve_path(&path)?;
+        let resolved_path = self.path_resolver.resolve_path(&path)?;
 
         // Determina se è un'operazione di scrittura
         let is_write = pflags.intersects(
@@ -407,7 +257,7 @@ impl russh_sftp::server::Handler for SftpSession {
                                 "Successfully opened file for write with handle: {} (binary: {})",
                                 handle, open_file.is_binary
                             );
-                            self.open_files.insert(handle.clone(), open_file);
+                            self.state.open_files.insert(handle.clone(), open_file);
                             Ok(Handle { id, handle })
                         }
                         Err(e) => {
@@ -446,7 +296,7 @@ impl russh_sftp::server::Handler for SftpSession {
                         "Successfully opened file for read with handle: {} (binary: {})",
                         handle, open_file.is_binary
                     );
-                    self.open_files.insert(handle.clone(), open_file);
+                    self.state.open_files.insert(handle.clone(), open_file);
                     Ok(Handle { id, handle })
                 }
                 Err(e) => {
@@ -474,9 +324,9 @@ impl russh_sftp::server::Handler for SftpSession {
             handle, offset, len
         );
 
-        if let Some(open_file) = self.open_files.get_mut(&handle) {
+        if let Some(open_file) = self.state.open_files.get_mut(&handle) {
             // Limita la dimensione della lettura al massimo configurato
-            let actual_len = std::cmp::min(len, self.max_read_size);
+            let actual_len = std::cmp::min(len, self.state.max_read_size);
 
             match open_file.file.seek(std::io::SeekFrom::Start(offset)).await {
                 Ok(actual_offset) => {
@@ -542,7 +392,7 @@ impl russh_sftp::server::Handler for SftpSession {
             handle, offset, data.len()
         );
 
-        if let Some(open_file) = self.open_files.get_mut(&handle) {
+        if let Some(open_file) = self.state.open_files.get_mut(&handle) {
             match open_file.file.seek(std::io::SeekFrom::Start(offset)).await {
                 Ok(actual_offset) => {
                     if actual_offset != offset {
@@ -592,11 +442,11 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
         info!("stat: {}", path);
 
-        let resolved_path = self.resolve_path(&path)?;
+        let resolved_path = self.path_resolver.resolve_path(&path)?;
 
         match fs::metadata(&resolved_path).await {
             Ok(metadata) => {
-                let attrs = Self::metadata_to_file_attributes(&metadata).await;
+                let attrs = MetadataConverter::to_file_attributes(&metadata).await;
                 info!(
                     "stat result for {:?}: size={:?}, is_file={}",
                     resolved_path,
@@ -623,11 +473,11 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
         info!("lstat: {}", path);
 
-        let resolved_path = self.resolve_path(&path)?;
+        let resolved_path = self.path_resolver.resolve_path(&path)?;
 
         match fs::symlink_metadata(&resolved_path).await {
             Ok(metadata) => {
-                let attrs = Self::metadata_to_file_attributes(&metadata).await;
+                let attrs = MetadataConverter::to_file_attributes(&metadata).await;
                 Ok(russh_sftp::protocol::Attrs { id, attrs })
             }
             Err(e) => {
@@ -648,10 +498,10 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
         info!("fstat handle: {}", handle);
 
-        if let Some(open_file) = self.open_files.get(&handle) {
+        if let Some(open_file) = self.state.open_files.get(&handle) {
             match open_file.file.metadata().await {
                 Ok(metadata) => {
-                    let attrs = Self::metadata_to_file_attributes(&metadata).await;
+                    let attrs = MetadataConverter::to_file_attributes(&metadata).await;
                     Ok(russh_sftp::protocol::Attrs { id, attrs })
                 }
                 Err(e) => {

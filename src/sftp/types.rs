@@ -9,7 +9,7 @@ pub type OpenDirs = HashMap<HandleId, fs::ReadDir>;
 
 pub struct SessionState {
     pub version: Option<u32>,
-    pub root_dir: PathBuf,
+    pub _root_dir: PathBuf,
     pub open_files: OpenFiles,
     pub open_dirs: OpenDirs,
     pub handle_counter: u32,

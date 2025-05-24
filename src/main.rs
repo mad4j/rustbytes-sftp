@@ -10,8 +10,8 @@ use std::time::Duration;
 mod args;
 mod file_info;
 mod server;
-mod sftp_session;
 mod ssh_session;
+mod sftp;
 
 #[tokio::main]
 async fn main() {

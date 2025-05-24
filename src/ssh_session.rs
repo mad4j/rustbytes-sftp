@@ -8,7 +8,8 @@ use russh::{Channel, ChannelId};
 use tokio::sync::Mutex;
 
 use crate::server::ServerConfig;
-use crate::sftp_session::SftpSession;
+use crate::sftp::SftpSession;
+
 
 pub struct SshSession {
     clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,

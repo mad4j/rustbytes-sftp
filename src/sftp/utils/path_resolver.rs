@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
-use russh_sftp::protocol::StatusCode;
 use log::warn;
+use russh_sftp::protocol::StatusCode;
+use std::path::{Path, PathBuf};
 
 pub struct PathResolver {
     root_dir: PathBuf,
@@ -26,7 +26,10 @@ impl PathResolver {
                 if canonical.starts_with(&self.root_dir) {
                     Ok(canonical)
                 } else {
-                    warn!("Tentativo di accesso fuori dalla root directory: {:?}", canonical);
+                    warn!(
+                        "Tentativo di accesso fuori dalla root directory: {:?}",
+                        canonical
+                    );
                     Err(StatusCode::PermissionDenied)
                 }
             }
@@ -38,7 +41,10 @@ impl PathResolver {
                             if canonical_parent.starts_with(&self.root_dir) {
                                 Ok(resolved)
                             } else {
-                                warn!("Tentativo di accesso fuori dalla root directory: {:?}", resolved);
+                                warn!(
+                                    "Tentativo di accesso fuori dalla root directory: {:?}",
+                                    resolved
+                                );
                                 Err(StatusCode::PermissionDenied)
                             }
                         }

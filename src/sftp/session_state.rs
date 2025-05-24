@@ -1,7 +1,7 @@
+use crate::file_info::FileInfo;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
-use crate::file_info::FileInfo;
 
 pub type HandleId = String;
 pub type OpenFiles = HashMap<HandleId, FileInfo>;

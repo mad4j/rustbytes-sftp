@@ -10,7 +10,6 @@ use tokio::sync::Mutex;
 use crate::server::ServerConfig;
 use crate::sftp::SftpSession;
 
-
 pub struct SshSession {
     clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
     config: Arc<ServerConfig>,

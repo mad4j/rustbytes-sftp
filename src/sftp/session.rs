@@ -1,30 +1,23 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use log::{error, info, warn};
 use russh_sftp::protocol::{
-    File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
+    Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
 };
 
 use crate::{file_info::FileInfo, server::ServerConfig, sftp::utils::metadata::MetadataConverter};
 
-use super::{utils::path_resolver::PathResolver, SessionState};
+use super::{
+    SessionState,
+    handlers::{self, file_ops},
+    utils::path_resolver::PathResolver,
+};
 
 pub struct SftpSession {
-    /*
-    version: Option<u32>,
-    root_dir: PathBuf,
-    open_files: HashMap<String, FileInfo>,
-    open_dirs: HashMap<String, tokio::fs::ReadDir>,
-    handle_counter: u32,
-    max_read_size: u32,
-    */
     pub(crate) state: SessionState,
     pub(crate) path_resolver: PathResolver,
 }
@@ -48,7 +41,6 @@ impl SftpSession {
         self.state.handle_counter += 1;
         format!("handle_{}", self.state.handle_counter)
     }
-
 }
 
 impl russh_sftp::server::Handler for SftpSession {
@@ -69,7 +61,10 @@ impl russh_sftp::server::Handler for SftpSession {
         }
 
         self.state.version = Some(version);
-        info!("version: {:?}, extensions: {:?}", self.state.version, extensions);
+        info!(
+            "version: {:?}, extensions: {:?}",
+            self.state.version, extensions
+        );
         Ok(Version::new())
     }
 
@@ -117,57 +112,7 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        info!("readdir handle: {}", handle);
-
-        if let Some(read_dir) = self.state.open_dirs.get_mut(&handle) {
-            let mut files = Vec::new();
-
-            // Leggi alcuni file dalla directory
-            for _ in 0..10 {
-                // Leggi massimo 10 file per volta
-                match read_dir.next_entry().await {
-                    Ok(Some(entry)) => {
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        match entry.metadata().await {
-                            Ok(metadata) => {
-                                //let attrs = Self::metadata_to_file_attributes(&metadata).await;
-                                let attrs = MetadataConverter::to_file_attributes(&metadata).await;
-                                let longname = MetadataConverter::format_longname(&file_name, &metadata).await;
-                                files.push(File {
-                                    filename: file_name,
-                                    longname,
-                                    attrs,
-                                });
-                            }
-                            Err(e) => {
-                                warn!("Failed to get metadata for {}: {}", file_name, e);
-                                // Crea attributi di default per file regolare
-                                let mut attrs = FileAttributes::default();
-                                attrs.permissions = Some(0o100644); // File regolare con permessi rw-r--r--
-                                files.push(File {
-                                    filename: file_name.clone(),
-                                    longname: format!(
-                                        "-rw-r--r-- 1 root root 0 Jan  1 00:00 {}",
-                                        file_name
-                                    ),
-                                    attrs,
-                                });
-                            }
-                        }
-                    }
-                    Ok(None) => break, // Fine directory
-                    Err(_) => break,
-                }
-            }
-
-            if files.is_empty() {
-                Err(StatusCode::Eof)
-            } else {
-                Ok(Name { id, files })
-            }
-        } else {
-            Err(StatusCode::BadMessage)
-        }
+        handlers::dir_ops::hanle_readdir(self, id, handle).await
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
@@ -178,11 +123,12 @@ impl russh_sftp::server::Handler for SftpSession {
         match resolved_path.canonicalize() {
             Ok(canonical) => {
                 // Converti il path canonico in un path relativo alla root
-                let relative_path = if let Ok(rel) = canonical.strip_prefix(&self.path_resolver.get_root_dir()) {
-                    format!("/{}", rel.to_string_lossy())
-                } else {
-                    "/".to_string()
-                };
+                let relative_path =
+                    if let Ok(rel) = canonical.strip_prefix(&self.path_resolver.get_root_dir()) {
+                        format!("/{}", rel.to_string_lossy())
+                    } else {
+                        "/".to_string()
+                    };
 
                 Ok(Name {
                     id,
@@ -209,7 +155,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
         // Determina se è un'operazione di scrittura
         let is_write = pflags.intersects(
-            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND,
         );
 
         if is_write {
@@ -224,48 +170,46 @@ impl russh_sftp::server::Handler for SftpSession {
             // Crea o apri il file per scrittura
             let open_options = {
                 let mut opts = fs::OpenOptions::new();
-                
+
                 if pflags.contains(OpenFlags::READ) {
                     opts.read(true);
                 }
-                
+
                 if pflags.contains(OpenFlags::WRITE) {
                     opts.write(true);
                 }
-                
+
                 if pflags.contains(OpenFlags::CREATE) {
                     opts.create(true);
                 }
-                
+
                 if pflags.contains(OpenFlags::TRUNCATE) {
                     opts.truncate(true);
                 }
-                
+
                 if pflags.contains(OpenFlags::APPEND) {
                     opts.append(true);
                 }
-                
+
                 opts
             };
 
             match open_options.open(&resolved_path).await {
-                Ok(file) => {
-                    match FileInfo::from_file(file, resolved_path).await {
-                        Ok(open_file) => {
-                            let handle = self.next_handle();
-                            info!(
-                                "Successfully opened file for write with handle: {} (binary: {})",
-                                handle, open_file.is_binary
-                            );
-                            self.state.open_files.insert(handle.clone(), open_file);
-                            Ok(Handle { id, handle })
-                        }
-                        Err(e) => {
-                            warn!("Failed to create FileInfo: {}", e);
-                            Err(StatusCode::Failure)
-                        }
+                Ok(file) => match FileInfo::from_file(file, resolved_path).await {
+                    Ok(open_file) => {
+                        let handle = self.next_handle();
+                        info!(
+                            "Successfully opened file for write with handle: {} (binary: {})",
+                            handle, open_file.is_binary
+                        );
+                        self.state.open_files.insert(handle.clone(), open_file);
+                        Ok(Handle { id, handle })
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to create FileInfo: {}", e);
+                        Err(StatusCode::Failure)
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to open/create file {:?}: {}", resolved_path, e);
                     match e.kind() {
@@ -318,65 +262,8 @@ impl russh_sftp::server::Handler for SftpSession {
         handle: String,
         offset: u64,
         len: u32,
-    ) -> Result<russh_sftp::protocol::Data, Self::Error> {
-        info!(
-            "read handle: {}, offset: {}, requested len: {}",
-            handle, offset, len
-        );
-
-        if let Some(open_file) = self.state.open_files.get_mut(&handle) {
-            // Limita la dimensione della lettura al massimo configurato
-            let actual_len = std::cmp::min(len, self.state.max_read_size);
-
-            match open_file.file.seek(std::io::SeekFrom::Start(offset)).await {
-                Ok(actual_offset) => {
-                    if actual_offset != offset {
-                        warn!("Seek to {} resulted in position {}", offset, actual_offset);
-                    }
-
-                    let mut buffer = vec![0u8; actual_len as usize];
-                    match open_file.file.read(&mut buffer).await {
-                        Ok(bytes_read) => {
-                            if bytes_read == 0 {
-                                info!("End of file reached for handle: {}", handle);
-                                Err(StatusCode::Eof)
-                            } else {
-                                buffer.truncate(bytes_read);
-
-                                info!(
-                                    "Successfully read {} bytes from handle: {} (binary: {}, offset: {})",
-                                    bytes_read, handle, open_file.is_binary, offset
-                                );
-
-                                // Log aggiuntivo per file di testo (primi 100 caratteri se non binario)
-                                if !open_file.is_binary && bytes_read > 0 {
-                                    let preview = String::from_utf8_lossy(
-                                        &buffer[..std::cmp::min(100, bytes_read)],
-                                    );
-                                    info!(
-                                        "Text file preview: {}",
-                                        preview.chars().take(50).collect::<String>()
-                                    );
-                                }
-
-                                Ok(russh_sftp::protocol::Data { id, data: buffer })
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to read from file handle {}: {}", handle, e);
-                            Err(StatusCode::Failure)
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to seek in file handle {}: {}", handle, e);
-                    Err(StatusCode::Failure)
-                }
-            }
-        } else {
-            warn!("Invalid file handle: {}", handle);
-            Err(StatusCode::BadMessage)
-        }
+    ) -> Result<Data, StatusCode> {
+        file_ops::handle_read(self, id, handle, offset, len).await
     }
 
     /// Implementazione del comando WRITE per supportare upload di file
@@ -389,7 +276,9 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<Status, Self::Error> {
         info!(
             "write handle: {}, offset: {}, data len: {}",
-            handle, offset, data.len()
+            handle,
+            offset,
+            data.len()
         );
 
         if let Some(open_file) = self.state.open_files.get_mut(&handle) {
@@ -408,7 +297,9 @@ impl russh_sftp::server::Handler for SftpSession {
 
                             info!(
                                 "Successfully wrote {} bytes to handle: {} at offset: {}",
-                                data.len(), handle, offset
+                                data.len(),
+                                handle,
+                                offset
                             );
 
                             Ok(Status {

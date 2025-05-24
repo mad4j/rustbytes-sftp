@@ -10,7 +10,7 @@ use russh_sftp::protocol::{
 };
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 
 use crate::{file_info::FileInfo, server::ServerConfig};
@@ -357,34 +357,105 @@ impl russh_sftp::server::Handler for SftpSession {
 
         let resolved_path = self.resolve_path(&path)?;
 
-        // Controlla se il file esiste
-        if !resolved_path.exists() {
-            warn!("File does not exist: {:?}", resolved_path);
-            return Err(StatusCode::NoSuchFile);
-        }
+        // Determina se è un'operazione di scrittura
+        let is_write = pflags.intersects(
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND
+        );
 
-        // Controlla se è un file regolare
-        if !resolved_path.is_file() {
-            warn!("Path is not a regular file: {:?}", resolved_path);
-            return Err(StatusCode::Failure);
-        }
-
-        match FileInfo::new(resolved_path).await {
-            Ok(open_file) => {
-                let handle = self.next_handle();
-                info!(
-                    "Successfully opened file with handle: {} (binary: {})",
-                    handle, open_file.is_binary
-                );
-                self.open_files.insert(handle.clone(), open_file);
-                Ok(Handle { id, handle })
+        if is_write {
+            // Per operazioni di scrittura, assicurati che la directory parent esista
+            if let Some(parent) = resolved_path.parent() {
+                if !parent.exists() {
+                    warn!("Parent directory does not exist: {:?}", parent);
+                    return Err(StatusCode::NoSuchFile);
+                }
             }
-            Err(e) => {
-                warn!("Failed to open file: {}", e);
-                match e.kind() {
-                    std::io::ErrorKind::NotFound => Err(StatusCode::NoSuchFile),
-                    std::io::ErrorKind::PermissionDenied => Err(StatusCode::PermissionDenied),
-                    _ => Err(StatusCode::Failure),
+
+            // Crea o apri il file per scrittura
+            let open_options = {
+                let mut opts = fs::OpenOptions::new();
+                
+                if pflags.contains(OpenFlags::READ) {
+                    opts.read(true);
+                }
+                
+                if pflags.contains(OpenFlags::WRITE) {
+                    opts.write(true);
+                }
+                
+                if pflags.contains(OpenFlags::CREATE) {
+                    opts.create(true);
+                }
+                
+                if pflags.contains(OpenFlags::TRUNCATE) {
+                    opts.truncate(true);
+                }
+                
+                if pflags.contains(OpenFlags::APPEND) {
+                    opts.append(true);
+                }
+                
+                opts
+            };
+
+            match open_options.open(&resolved_path).await {
+                Ok(file) => {
+                    match FileInfo::from_file(file, resolved_path).await {
+                        Ok(open_file) => {
+                            let handle = self.next_handle();
+                            info!(
+                                "Successfully opened file for write with handle: {} (binary: {})",
+                                handle, open_file.is_binary
+                            );
+                            self.open_files.insert(handle.clone(), open_file);
+                            Ok(Handle { id, handle })
+                        }
+                        Err(e) => {
+                            warn!("Failed to create FileInfo: {}", e);
+                            Err(StatusCode::Failure)
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to open/create file {:?}: {}", resolved_path, e);
+                    match e.kind() {
+                        std::io::ErrorKind::NotFound => Err(StatusCode::NoSuchFile),
+                        std::io::ErrorKind::PermissionDenied => Err(StatusCode::PermissionDenied),
+                        std::io::ErrorKind::AlreadyExists => Err(StatusCode::Failure),
+                        _ => Err(StatusCode::Failure),
+                    }
+                }
+            }
+        } else {
+            // Per operazioni di lettura, il file deve esistere
+            if !resolved_path.exists() {
+                warn!("File does not exist: {:?}", resolved_path);
+                return Err(StatusCode::NoSuchFile);
+            }
+
+            // Controlla se è un file regolare
+            if !resolved_path.is_file() {
+                warn!("Path is not a regular file: {:?}", resolved_path);
+                return Err(StatusCode::Failure);
+            }
+
+            match FileInfo::new(resolved_path).await {
+                Ok(open_file) => {
+                    let handle = self.next_handle();
+                    info!(
+                        "Successfully opened file for read with handle: {} (binary: {})",
+                        handle, open_file.is_binary
+                    );
+                    self.open_files.insert(handle.clone(), open_file);
+                    Ok(Handle { id, handle })
+                }
+                Err(e) => {
+                    warn!("Failed to open file: {}", e);
+                    match e.kind() {
+                        std::io::ErrorKind::NotFound => Err(StatusCode::NoSuchFile),
+                        std::io::ErrorKind::PermissionDenied => Err(StatusCode::PermissionDenied),
+                        _ => Err(StatusCode::Failure),
+                    }
                 }
             }
         }
@@ -454,6 +525,62 @@ impl russh_sftp::server::Handler for SftpSession {
             }
         } else {
             warn!("Invalid file handle: {}", handle);
+            Err(StatusCode::BadMessage)
+        }
+    }
+
+    /// Implementazione del comando WRITE per supportare upload di file
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        info!(
+            "write handle: {}, offset: {}, data len: {}",
+            handle, offset, data.len()
+        );
+
+        if let Some(open_file) = self.open_files.get_mut(&handle) {
+            match open_file.file.seek(std::io::SeekFrom::Start(offset)).await {
+                Ok(actual_offset) => {
+                    if actual_offset != offset {
+                        warn!("Seek to {} resulted in position {}", offset, actual_offset);
+                    }
+
+                    match open_file.file.write_all(&data).await {
+                        Ok(_) => {
+                            // Assicurati che i dati siano scritti su disco
+                            if let Err(e) = open_file.file.flush().await {
+                                warn!("Failed to flush file handle {}: {}", handle, e);
+                            }
+
+                            info!(
+                                "Successfully wrote {} bytes to handle: {} at offset: {}",
+                                data.len(), handle, offset
+                            );
+
+                            Ok(Status {
+                                id,
+                                status_code: StatusCode::Ok,
+                                error_message: "Ok".to_string(),
+                                language_tag: "en-US".to_string(),
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to write to file handle {}: {}", handle, e);
+                            Err(StatusCode::Failure)
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to seek in file handle {}: {}", handle, e);
+                    Err(StatusCode::Failure)
+                }
+            }
+        } else {
+            warn!("Invalid file handle for write: {}", handle);
             Err(StatusCode::BadMessage)
         }
     }

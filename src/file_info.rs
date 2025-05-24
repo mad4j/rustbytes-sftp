@@ -24,6 +24,19 @@ impl FileInfo {
         })
     }
 
+
+    // Nuovo metodo per creare da un file già aperto
+    pub async fn from_file(file: fs::File, path: PathBuf) -> Result<Self, std::io::Error> {
+        let is_binary = Self::detect_binary_file(&path).await;
+        
+        Ok(Self {
+            file,
+            path,
+            is_binary,
+        })
+    }
+
+
     async fn detect_binary_file(path: &Path) -> bool {
         // Controllo basato sull'estensione del file
         if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
